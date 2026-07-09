@@ -63,17 +63,17 @@ clobbers hits an earlier run already wrote. Run bounded with `--count`, resume
 with `--start`, cross-check the results against the live factory with
 `--verify`.
 
-Expected time to a hit at 35.5 MH/s, both-ends placement. These are averages;
+Expected time to a hit at 100 MH/s, both-ends placement. These are averages;
 the search is memoryless, so your run may be lucky or unlucky:
 
 | word length | expected salts | expected time |
 |---|---|---|
 | 6 | 8.4M | under a second |
-| 7 | 134M | ~4 s |
-| 8 | 2.1B | ~1 min |
-| 9 | 34B | ~16 min |
-| 10 | 550B | ~4 h |
-| 11 | 8.8T | ~3 days |
+| 7 | 134M | ~1 s |
+| 8 | 2.1B | ~20 s |
+| 9 | 34B | ~6 min |
+| 10 | 550B | ~1.5 h |
+| 11 | 8.8T | ~1 day |
 
 Letter casing is not choosable: EIP-55 checksum casing falls out of the address
 itself, so `deadbeef` may render as `dEAdbEef`. Look at the exact rendering

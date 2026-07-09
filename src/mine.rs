@@ -17,20 +17,49 @@ impl Pos {
     }
 }
 
-enum Kind {
-    /// All words share one length and inner matching is off: binary search per end.
-    Uniform { len: usize, sorted: Vec<String> },
-    /// Longest-first linear scans, then inner scan.
-    General {
-        words: Vec<String>,
-        inner: Vec<String>,
-    },
+/// One same-length run of words anchored at one end of the window: a single
+/// mask selects the anchored nibbles and a sorted list of masked values is
+/// binary-searched per candidate.
+struct Group {
+    mask: u128,
+    /// (masked value, index into Matcher::words), sorted by value.
+    entries: Vec<(u128, usize)>,
 }
 
+/// All window positions of one inner-eligible word as (mask, value) pairs.
+struct InnerWord {
+    idx: usize,
+    positions: Vec<(u128, u128)>,
+}
+
+/// Matches candidate windows against the word list without leaving the
+/// integer domain: the 18-nibble tail sits in bits 127..=56 of the window
+/// (the kernel's big-endian view of the first 16 digest bytes), so every
+/// placement of every word is one masked compare. Precedence is prefix, then
+/// suffix, then inner, longest word first, exactly like the original
+/// string matcher; groups are ordered longest-first and words of equal
+/// length are mutually exclusive under the same mask, so a binary search
+/// inside a group cannot change which word wins.
 pub struct Matcher {
-    kind: Kind,
-    check_prefix: bool,
-    check_suffix: bool,
+    /// From words::parse_words: lowercase, deduped, longest-first.
+    words: Vec<String>,
+    prefix: Vec<Group>,
+    suffix: Vec<Group>,
+    inner: Vec<InnerWord>,
+}
+
+/// Nibble count of the grindable window.
+const WINDOW: usize = 18;
+
+fn word_bits(w: &str) -> u128 {
+    u128::from_str_radix(w, 16).expect("words are validated hex")
+}
+
+/// (mask, value) for a word covering nibbles p..p+len of the window.
+fn placement(w: &str, p: usize) -> (u128, u128) {
+    let shift = 128 - 4 * (p + w.len()) as u32;
+    let mask = ((1u128 << (4 * w.len())) - 1) << shift;
+    (mask, word_bits(w) << shift)
 }
 
 impl Matcher {
@@ -41,77 +70,74 @@ impl Matcher {
             Positions::Suffix => (false, true),
             Positions::Ends | Positions::Any => (true, true),
         };
-        let inner: Vec<String> = if positions == Positions::Any {
+
+        let anchored = |at_start: bool| -> Vec<Group> {
+            let mut groups: Vec<Group> = Vec::new();
+            for (idx, w) in words.iter().enumerate() {
+                let p = if at_start { 0 } else { WINDOW - w.len() };
+                let (mask, value) = placement(w, p);
+                match groups.last_mut() {
+                    // words arrive longest-first, so equal lengths are adjacent
+                    Some(g) if g.mask == mask => g.entries.push((value, idx)),
+                    _ => groups.push(Group {
+                        mask,
+                        entries: vec![(value, idx)],
+                    }),
+                }
+            }
+            for g in &mut groups {
+                g.entries.sort_unstable();
+            }
+            groups
+        };
+
+        let inner: Vec<InnerWord> = if positions == Positions::Any {
             words
                 .iter()
-                .filter(|w| w.len() >= inner_min)
-                .cloned()
+                .enumerate()
+                .filter(|(_, w)| w.len() >= inner_min)
+                .map(|(idx, w)| InnerWord {
+                    idx,
+                    positions: (0..=WINDOW - w.len()).map(|p| placement(w, p)).collect(),
+                })
                 .collect()
         } else {
             Vec::new()
         };
-        let lens: std::collections::HashSet<usize> = words.iter().map(|w| w.len()).collect();
-        let kind = if lens.len() == 1 && inner.is_empty() {
-            let mut sorted = words.to_vec();
-            sorted.sort();
-            Kind::Uniform {
-                len: *lens.iter().next().unwrap(),
-                sorted,
-            }
-        } else {
-            Kind::General {
-                words: words.to_vec(),
-                inner,
-            }
-        };
+
         Matcher {
-            kind,
-            check_prefix,
-            check_suffix,
+            words: words.to_vec(),
+            prefix: if check_prefix {
+                anchored(true)
+            } else {
+                Vec::new()
+            },
+            suffix: if check_suffix {
+                anchored(false)
+            } else {
+                Vec::new()
+            },
+            inner,
         }
     }
 
-    /// At most one hit per tail: prefix, then suffix, then inner.
-    pub fn find<'a>(&'a self, tail_hex: &[u8; 18]) -> Option<(Pos, &'a str)> {
-        match &self.kind {
-            Kind::Uniform { len, sorted } => {
-                if self.check_prefix {
-                    let head = &tail_hex[..*len];
-                    if let Ok(i) = sorted.binary_search_by(|w| w.as_bytes().cmp(head)) {
-                        return Some((Pos::Prefix, &sorted[i]));
-                    }
+    /// At most one hit per window: prefix, then suffix, then inner.
+    #[inline]
+    pub fn find(&self, window: u128) -> Option<(Pos, &str)> {
+        for (groups, pos) in [(&self.prefix, Pos::Prefix), (&self.suffix, Pos::Suffix)] {
+            for g in groups {
+                let v = window & g.mask;
+                if let Ok(k) = g.entries.binary_search_by(|e| e.0.cmp(&v)) {
+                    return Some((pos, &self.words[g.entries[k].1]));
                 }
-                if self.check_suffix {
-                    let end = &tail_hex[18 - len..];
-                    if let Ok(i) = sorted.binary_search_by(|w| w.as_bytes().cmp(end)) {
-                        return Some((Pos::Suffix, &sorted[i]));
-                    }
-                }
-                None
-            }
-            Kind::General { words, inner } => {
-                if self.check_prefix {
-                    for w in words {
-                        if tail_hex.starts_with(w.as_bytes()) {
-                            return Some((Pos::Prefix, w));
-                        }
-                    }
-                }
-                if self.check_suffix {
-                    for w in words {
-                        if tail_hex.ends_with(w.as_bytes()) {
-                            return Some((Pos::Suffix, w));
-                        }
-                    }
-                }
-                for w in inner {
-                    if tail_hex.windows(w.len()).any(|win| win == w.as_bytes()) {
-                        return Some((Pos::Inner, w));
-                    }
-                }
-                None
             }
         }
+        for iw in &self.inner {
+            if iw.positions.iter().any(|&(m, v)| window & m == v) {
+                return Some((Pos::Inner, &self.words[iw.idx]));
+            }
+        }
+        None
     }
 }
 
@@ -120,46 +146,36 @@ mod tests {
     use super::*;
     use crate::words::Positions;
 
-    fn t(s: &str) -> [u8; 18] {
-        s.as_bytes().try_into().unwrap()
+    /// 18 hex chars -> the window u128 the kernel would produce (junk bits zero).
+    fn t(s: &str) -> u128 {
+        assert_eq!(s.len(), 18);
+        u128::from_str_radix(s, 16).unwrap() << (128 - 4 * WINDOW as u32)
     }
 
     #[test]
     fn uniform_fast_path_prefix_and_suffix() {
         let m = Matcher::new(&["dead".into(), "beef".into()], Positions::Ends, 6);
-        assert_eq!(
-            m.find(&t("dead12345678901234")),
-            Some((Pos::Prefix, "dead"))
-        );
-        assert_eq!(
-            m.find(&t("12345678901234beef")),
-            Some((Pos::Suffix, "beef"))
-        );
-        assert_eq!(m.find(&t("123456dead89012345")), None); // inner not enabled
-        assert_eq!(m.find(&t("123456789012345678")), None);
+        assert_eq!(m.find(t("dead12345678901234")), Some((Pos::Prefix, "dead")));
+        assert_eq!(m.find(t("12345678901234beef")), Some((Pos::Suffix, "beef")));
+        assert_eq!(m.find(t("123456dead89012345")), None); // inner not enabled
+        assert_eq!(m.find(t("123456789012345678")), None);
     }
 
     #[test]
     fn prefix_beats_suffix_beats_inner() {
         let m = Matcher::new(&["dead".into()], Positions::Ends, 4);
         // both ends match: prefix wins
-        assert_eq!(
-            m.find(&t("dead1234567890dead")),
-            Some((Pos::Prefix, "dead"))
-        );
+        assert_eq!(m.find(t("dead1234567890dead")), Some((Pos::Prefix, "dead")));
         let m = Matcher::new(&["dead".into(), "c0ffee".into()], Positions::Any, 4);
         // suffix and inner both present: suffix wins
-        assert_eq!(
-            m.find(&t("12c0ffee901234dead")),
-            Some((Pos::Suffix, "dead"))
-        );
+        assert_eq!(m.find(t("12c0ffee901234dead")), Some((Pos::Suffix, "dead")));
     }
 
     #[test]
     fn longest_word_wins_at_same_end() {
         let m = Matcher::new(&["deadbeef".into(), "dead".into()], Positions::Prefix, 6);
         assert_eq!(
-            m.find(&t("deadbeef9012345678")),
+            m.find(t("deadbeef9012345678")),
             Some((Pos::Prefix, "deadbeef"))
         );
     }
@@ -168,28 +184,119 @@ mod tests {
     fn inner_respects_inner_min() {
         let m = Matcher::new(&["c0ffee".into(), "dead".into()], Positions::Any, 6);
         assert_eq!(
-            m.find(&t("12c0ffee9012345678")),
+            m.find(t("12c0ffee9012345678")),
             Some((Pos::Inner, "c0ffee"))
         );
-        assert_eq!(m.find(&t("12dead345678901234")), None); // 4 < inner_min 6
+        assert_eq!(m.find(t("12dead345678901234")), None); // 4 < inner_min 6
     }
 
     #[test]
     fn prefix_only_and_suffix_only() {
         let m = Matcher::new(&["dead".into()], Positions::Prefix, 6);
-        assert_eq!(m.find(&t("12345678901234dead")), None);
+        assert_eq!(m.find(t("12345678901234dead")), None);
         let m = Matcher::new(&["dead".into()], Positions::Suffix, 6);
-        assert_eq!(m.find(&t("dead12345678901234")), None);
+        assert_eq!(m.find(t("dead12345678901234")), None);
+    }
+
+    #[test]
+    fn window_filling_words_match_at_the_boundaries() {
+        // 18 chars: prefix, suffix, and inner are the same single placement
+        let full = "abcdef0123456789ab";
+        let m = Matcher::new(&[full.into()], Positions::Ends, 6);
+        assert_eq!(m.find(t(full)), Some((Pos::Prefix, full)));
+        assert_eq!(m.find(t("abcdef0123456789aa")), None);
+        // 17 chars: the two end placements overlap in the middle 16
+        let w17 = &full[..17];
+        let m = Matcher::new(&[w17.to_string()], Positions::Any, 6);
+        assert_eq!(m.find(t(&format!("{w17}f"))), Some((Pos::Prefix, w17)));
+        assert_eq!(m.find(t(&format!("f{w17}"))), Some((Pos::Suffix, w17)));
+    }
+
+    /// The original string semantics, kept as the oracle for the mask matcher.
+    fn reference_find<'a>(
+        words: &'a [String],
+        positions: Positions,
+        inner_min: usize,
+        tail: &str,
+    ) -> Option<(Pos, &'a str)> {
+        let (cp, cs) = match positions {
+            Positions::Prefix => (true, false),
+            Positions::Suffix => (false, true),
+            Positions::Ends | Positions::Any => (true, true),
+        };
+        if cp {
+            if let Some(w) = words.iter().find(|w| tail.starts_with(w.as_str())) {
+                return Some((Pos::Prefix, w));
+            }
+        }
+        if cs {
+            if let Some(w) = words.iter().find(|w| tail.ends_with(w.as_str())) {
+                return Some((Pos::Suffix, w));
+            }
+        }
+        if positions == Positions::Any {
+            if let Some(w) = words
+                .iter()
+                .find(|w| w.len() >= inner_min && tail.contains(w.as_str()))
+            {
+                return Some((Pos::Inner, w));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn matches_reference_on_random_words_and_tails() {
+        let mut state = 0x2545f4914f6cdd1du128;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let hex = |n: u128, len: usize| format!("{n:018x}")[..len].to_string();
+        for _ in 0..300 {
+            // 1..=4 random words, lengths 1..=8 so collisions actually happen
+            let n_words = 1 + (rng() % 4) as usize;
+            let raw: Vec<String> = (0..n_words)
+                .map(|_| hex(rng(), 1 + (rng() % 8) as usize))
+                .collect();
+            let words = crate::words::parse_words(&raw.join(",")).unwrap();
+            for positions in [
+                Positions::Prefix,
+                Positions::Suffix,
+                Positions::Ends,
+                Positions::Any,
+            ] {
+                for inner_min in [2, 6] {
+                    let m = Matcher::new(&words, positions, inner_min);
+                    for _ in 0..40 {
+                        // half the tails get a word planted at a random spot
+                        let mut tail = format!("{:018x}", rng() >> 56);
+                        if rng() % 2 == 0 {
+                            let w = &words[(rng() % words.len() as u128) as usize];
+                            let p = (rng() % (19 - w.len() as u128)) as usize;
+                            tail.replace_range(p..p + w.len(), w);
+                        }
+                        assert_eq!(
+                            m.find(t(&tail)),
+                            reference_find(&words, positions, inner_min, &tail),
+                            "words {words:?} positions {positions:?} inner_min {inner_min} tail {tail}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
-use crate::{b20, words};
+use crate::{b20, kernel, words};
+use anyhow::Context;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
-use tiny_keccak::{Hasher, Keccak};
 
 pub struct MineOpts {
     pub deployer: [u8; 20],
@@ -202,7 +309,7 @@ pub struct MineOpts {
     pub out: PathBuf,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct HitRecord {
     pub word: String,
     pub position: String,
@@ -259,26 +366,26 @@ pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
         );
     }
 
-    // exact split: total scanned == count; the first (count % workers) workers
-    // take one extra salt so nothing overruns the requested total
-    let quotas: Option<Vec<u64>> = opts.count.map(|c| {
-        let base = c / opts.workers as u64;
-        let extra = (c % opts.workers as u64) as usize;
-        (0..opts.workers)
-            .map(|w| base + u64::from(w < extra))
-            .collect()
-    });
+    // Workers pull chunks from a shared offset counter instead of taking
+    // fixed quotas: on asymmetric cores (Apple Silicon P/E) fixed splits
+    // leave the fast cores idle while the slow ones finish their share, and
+    // dynamic dispatch also keeps the scanned region one contiguous range.
+    let next = Arc::new(AtomicU64::new(0));
     let (tx, rx) = mpsc::channel::<RawHit>();
 
+    // Open the output file up front so a bad path fails immediately with a
+    // clear error, instead of after the workers have already burned CPU (an
+    // unbounded run would otherwise mine indefinitely against a dead writer).
+    // Append-only so a resumed run (`--start`) accumulates hits on top of a
+    // prior run's file instead of truncating it.
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&opts.out)
+        .with_context(|| format!("cannot open output file {}", opts.out.display()))?;
+
     // writer thread: JSONL file + console line per hit
-    // opened append-only so a resumed run (`--start`) accumulates hits on top
-    // of a prior run's file instead of truncating it
-    let out_path = opts.out.clone();
     let writer = std::thread::spawn(move || -> anyhow::Result<Vec<HitRecord>> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&out_path)?;
         let mut buf = std::io::BufWriter::new(file);
         let mut records = Vec::new();
         for hit in rx {
@@ -310,34 +417,31 @@ pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
 
     let t0 = Instant::now();
     let mut handles = Vec::new();
-    for wid in 0..opts.workers {
+    for _ in 0..opts.workers {
         let matcher = matcher.clone();
         let stop = stop.clone();
         let scanned = scanned.clone();
+        let next = next.clone();
         let tx = tx.clone();
         let deployer = opts.deployer;
         let start = opts.start;
-        let stride = opts.workers as u128;
-        let quota = quotas.as_ref().map(|q| q[wid]);
+        let count = opts.count;
         handles.push(std::thread::spawn(move || {
-            worker(
-                wid as u128,
-                stride,
-                deployer,
-                start,
-                quota,
-                &matcher,
-                tx,
-                &scanned,
-                &stop,
-            )
+            worker(deployer, start, count, &next, &matcher, tx, &scanned, &stop)
         }));
     }
     drop(tx);
 
-    // progress loop on the main thread
+    // progress loop on the main thread: poll often so run end is noticed
+    // within ~50ms (a full-second wait would bleed into the measured rate
+    // of short runs), but keep the once-a-second print cadence
+    let mut last_print = Instant::now();
     while handles.iter().any(|h| !h.is_finished()) {
-        std::thread::sleep(Duration::from_millis(1000));
+        std::thread::sleep(Duration::from_millis(50));
+        if last_print.elapsed() < Duration::from_secs(1) {
+            continue;
+        }
+        last_print = Instant::now();
         let n = scanned.load(Ordering::Relaxed);
         let secs = t0.elapsed().as_secs_f64();
         let rate = n as f64 / secs.max(1e-9);
@@ -381,70 +485,93 @@ pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
     Ok(records)
 }
 
+/// Salts per dispatch chunk: big enough that the shared counter is
+/// uncontended, small enough that Ctrl-C lands within a few tens of
+/// milliseconds and the end-of-run straggler window stays negligible.
+const CHUNK: u64 = 1 << 17;
+
+// The dispatch counter is a u64 salt offset, so a single unbounded (`count ==
+// None`) invocation covers offsets 0..2^64 before it saturates and workers
+// exit -- roughly 5000 years at present throughput. Resuming past that with
+// `--start` reaches the rest of the u128 salt space; a wider counter would
+// only add contention to the hot dispatch path for a horizon no run reaches.
+
 #[allow(clippy::too_many_arguments)]
 fn worker(
-    wid: u128,
-    stride: u128,
     deployer: [u8; 20],
     start: u128,
-    per_worker: Option<u64>,
+    count: Option<u64>,
+    next: &AtomicU64,
     matcher: &Matcher,
     tx: mpsc::Sender<RawHit>,
     scanned: &AtomicU64,
     stop: &AtomicBool,
 ) {
-    let mut pre = [0u8; 64];
-    pre[12..32].copy_from_slice(&deployer);
-    let mut i = match start.checked_add(wid) {
-        Some(v) => v,
-        None => return,
+    let kernel = kernel::TailKernel::new(&deployer);
+    let send_hit = |salt: u128, window: u128, pos: Pos, word: &str| -> bool {
+        let mut tail = [0u8; 9];
+        tail.copy_from_slice(&window.to_be_bytes()[..9]);
+        tx.send(RawHit {
+            word: word.to_string(),
+            pos,
+            salt,
+            tail,
+        })
+        .is_ok()
     };
-    let mut n: u64 = 0;
-    let mut since: u64 = 0;
     loop {
-        if let Some(c) = per_worker {
-            if n >= c {
-                break;
-            }
-        }
-        pre[48..].copy_from_slice(&i.to_be_bytes()); // bytes 32..48 stay zero
-        let mut h = [0u8; 32];
-        let mut k = Keccak::v256();
-        k.update(&pre);
-        k.finalize(&mut h);
-        let mut tail_hex = [0u8; 18];
-        b20::hex_lower(&h[..9], &mut tail_hex);
-        if let Some((pos, word)) = matcher.find(&tail_hex) {
-            let mut tail = [0u8; 9];
-            tail.copy_from_slice(&h[..9]);
-            if tx
-                .send(RawHit {
-                    word: word.to_string(),
-                    pos,
-                    salt: i,
-                    tail,
-                })
-                .is_err()
-            {
-                break;
-            }
-        }
-        n += 1;
-        since += 1;
-        // stop flag checked every 65,536 salts (~10 ms of work), not every
-        // iteration: an atomic load in the hot loop costs more than prompt
-        // Ctrl-C response is worth
-        if since == 65_536 {
-            scanned.fetch_add(since, Ordering::Relaxed);
-            since = 0;
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-        }
-        i = match i.checked_add(stride) {
-            Some(v) => v,
-            None => break,
+        // saturating grab: a plain fetch_add would wrap the shared counter at
+        // u64::MAX and hand already-scanned ranges out again
+        let begin = next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_add(CHUNK))
+            })
+            .expect("fetch_update closure always returns Some");
+        let end = match count {
+            Some(c) => c.min(begin.saturating_add(CHUNK)),
+            None => begin.saturating_add(CHUNK),
         };
+        if begin >= end {
+            break;
+        }
+        let Some(first) = start.checked_add(begin as u128) else {
+            break;
+        };
+        // clamp so no salt in the chunk can wrap past u128::MAX
+        let len = (((end - begin) as u128 - 1).min(u128::MAX - first) + 1) as u64;
+
+        let mut off: u64 = 0;
+        while off + 1 < len {
+            let (sa, sb) = (first + off as u128, first + off as u128 + 1);
+            let (wa, wb) = kernel.window2(sa, sb);
+            if let Some((pos, word)) = matcher.find(wa) {
+                if !send_hit(sa, wa, pos, word) {
+                    return;
+                }
+            }
+            if let Some((pos, word)) = matcher.find(wb) {
+                if !send_hit(sb, wb, pos, word) {
+                    return;
+                }
+            }
+            off += 2;
+        }
+        if off < len {
+            let sa = first + off as u128;
+            let wa = kernel.window(sa);
+            if let Some((pos, word)) = matcher.find(wa) {
+                if !send_hit(sa, wa, pos, word) {
+                    return;
+                }
+            }
+        }
+
+        scanned.fetch_add(len, Ordering::Relaxed);
+        // one stop check per chunk (~131k salts): prompt Ctrl-C without an
+        // atomic load in the hash loop; a clamped chunk means the u128 salt
+        // space itself is exhausted
+        if stop.load(Ordering::Relaxed) || len < end - begin {
+            break;
+        }
     }
-    scanned.fetch_add(since, Ordering::Relaxed);
 }

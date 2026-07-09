@@ -56,6 +56,29 @@ fn mined_hits_rederive_and_match_placement() {
     assert_eq!(file_lines_after, hits.len() + hits2.len());
 }
 
+#[test]
+fn unopenable_output_path_fails_before_mining() {
+    // A directory that does not exist must surface an error immediately rather
+    // than spawning workers that mine (potentially unbounded) against a writer
+    // that already died opening the file.
+    let deployer = b20::parse_address("0x1111111111111111111111111111111111111111").unwrap();
+    let err = mine::run(mine::MineOpts {
+        deployer,
+        words: words::parse_words("dead").unwrap(),
+        positions: words::Positions::Ends,
+        inner_min: 6,
+        start: 0,
+        count: None, // unbounded: only fails fast if the file opens up front
+        workers: 2,
+        out: std::path::PathBuf::from("/no/such/directory/hits.jsonl"),
+    })
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("cannot open output file"),
+        "unexpected error: {err}"
+    );
+}
+
 fn hex32(salt: u128) -> String {
     let bytes = b20::salt_bytes(salt);
     let mut out = vec![0u8; 64];
