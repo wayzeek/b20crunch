@@ -1,4 +1,4 @@
-use b20crunch::{b20, mine, words};
+use b20crunch::{b20, chain, mine, words};
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -17,6 +17,23 @@ struct Cli {
 enum Cmd {
     /// Mine salts whose B20 address spells one of your words
     Mine(MineArgs),
+    /// Check a salt against the live factory (read-only)
+    Verify(VerifyArgs),
+}
+
+#[derive(Args)]
+struct VerifyArgs {
+    /// EOA that will call createB20 directly
+    #[arg(long)]
+    deployer: String,
+    /// Salt as a decimal integer
+    #[arg(long)]
+    salt: u128,
+    /// Expected ASSET address; exit nonzero on mismatch
+    #[arg(long)]
+    expect: Option<String>,
+    #[arg(long, default_value = b20crunch::chain::DEFAULT_RPC)]
+    rpc: String,
 }
 
 #[derive(Args)]
@@ -45,6 +62,12 @@ struct MineArgs {
     /// Output JSONL file
     #[arg(long, default_value = "hits.jsonl")]
     out: PathBuf,
+    /// After the run, cross-check every hit against the live factory
+    #[arg(long)]
+    verify: bool,
+    /// RPC endpoint, used only with --verify
+    #[arg(long, default_value = b20crunch::chain::DEFAULT_RPC)]
+    rpc: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -52,7 +75,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Mine(a) => {
             let deployer = b20::parse_address(&a.deployer).map_err(anyhow::Error::msg)?;
             let words = words::parse_words(&a.words).map_err(anyhow::Error::msg)?;
-            mine::run(mine::MineOpts {
+            let hits = mine::run(mine::MineOpts {
                 deployer,
                 words,
                 positions: a.positions,
@@ -62,6 +85,23 @@ fn main() -> anyhow::Result<()> {
                 workers: a.workers.unwrap_or_else(num_cpus::get),
                 out: a.out,
             })?;
+            if a.verify {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(chain::verify_hits(&a.rpc, deployer, &hits))?;
+            }
+            Ok(())
+        }
+        Cmd::Verify(a) => {
+            let deployer = b20::parse_address(&a.deployer).map_err(anyhow::Error::msg)?;
+            let expect = a
+                .expect
+                .map(|e| b20::parse_address(&e).map_err(anyhow::Error::msg))
+                .transpose()?;
+            let rt = tokio::runtime::Runtime::new()?;
+            let ok = rt.block_on(chain::verify(&a.rpc, deployer, a.salt, expect))?;
+            if !ok {
+                std::process::exit(1);
+            }
             Ok(())
         }
     }
