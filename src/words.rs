@@ -106,7 +106,10 @@ mod tests {
         let ends = expected_salts_per_hit(6, Positions::Ends, 6);
         assert!((ends - 16f64.powi(6) / 2.0).abs() / ends < 0.001);
         // full window: single placement, no doubling
-        assert_eq!(expected_salts_per_hit(18, Positions::Ends, 6), 16f64.powi(18));
+        assert_eq!(
+            expected_salts_per_hit(18, Positions::Ends, 6),
+            16f64.powi(18)
+        );
         // any: 19 - L placements at L=8 -> 11x a single end
         let any = expected_salts_per_hit(8, Positions::Any, 6);
         assert!((any - 16f64.powi(8) / 11.0).abs() / any < 0.01);

@@ -8,15 +8,24 @@ const DOC_DEPLOYER: &str = "0x1111111111111111111111111111111111111111";
 //     "getB20Address(uint8,address,bytes32)(address)" <variant> <deployer> <salt32> \
 //     --rpc-url https://mainnet.base.org
 const VECTORS: &[(u128, &str, &str, &str)] = &[
-    (0, "f043c50fe795c69f30",
+    (
+        0,
+        "f043c50fe795c69f30",
         "0xb200000000000000000000f043c50fe795c69f30",
-        "0xb200000000000000000001F043C50fe795C69f30"),
-    (1, "8eec1c9afb183a84aa",
+        "0xb200000000000000000001F043C50fe795C69f30",
+    ),
+    (
+        1,
+        "8eec1c9afb183a84aa",
         "0xb2000000000000000000008eec1c9AFB183a84aa",
-        "0xB2000000000000000000018eec1C9afb183a84aa"),
-    (42, "c775cb6f4825b8f8a4",
+        "0xB2000000000000000000018eec1C9afb183a84aa",
+    ),
+    (
+        42,
+        "c775cb6f4825b8f8a4",
         "0xB200000000000000000000C775cB6F4825b8f8A4",
-        "0xb200000000000000000001C775cb6F4825b8f8a4"),
+        "0xb200000000000000000001C775cb6F4825b8f8a4",
+    ),
 ];
 
 #[test]
