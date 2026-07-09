@@ -9,7 +9,7 @@ Every B20 token lives at an address shaped like this:
 ```
 
 The first part is fixed by the standard. The last 18 characters are derived from
-`keccak256(abi.encode(deployer, salt))` — and you choose the salt. Which means
+`keccak256(abi.encode(deployer, salt))`. You choose the salt. Which means
 those 18 characters can spell something. Your ticker. Your product. `c0ffee`.
 `deadbeef`. Whatever fits in hex.
 
@@ -21,7 +21,7 @@ address: 0xB200000000000000000000c0FFeeA7F58D19C4Ef
 
 ## How it works
 
-`createB20` derives the token address from the caller and a salt — nothing else.
+`createB20` derives the token address from the caller and a salt, nothing else.
 That has three pleasant consequences:
 
 - **Salts are deployer-bound.** A salt mined for your account is worthless to
@@ -33,8 +33,8 @@ That has three pleasant consequences:
   network your deployer uses.
 
 One caveat: the *deployer account itself* must call `createB20`. A multisig, a
-proxy, or a deployer contract in between changes the sender and voids the salt —
-mine against whatever account will actually send the transaction.
+proxy, or a deployer contract in between changes the sender and voids the salt.
+Mine against whatever account will actually send the transaction.
 
 ## Install
 
@@ -58,8 +58,8 @@ o=0, l/i=1, s=5, t=7, g=6, z=2. Placement defaults to either end of the window
 terminal. Run bounded with `--count`, resume with `--start`, cross-check the
 results against the live factory with `--verify`.
 
-Expected time to a hit at 35.5 MH/s (both-ends placement, averages — the
-search is memoryless, so your run may be lucky or unlucky):
+Expected time to a hit at 35.5 MH/s, both-ends placement. These are averages;
+the search is memoryless, so your run may be lucky or unlucky:
 
 | word length | expected salts | expected time |
 |---|---|---|
@@ -92,8 +92,8 @@ b20crunch deploy --deployer 0xYourDeployer --salt 123456 --expect 0xB2... \
 ```
 
 Dry-run by default: local derivation, factory derivation, availability, and a
-gasless simulation, then it prints the exact transaction — decoded arguments and
-raw calldata — and stops. Add `--send` to broadcast, with the deployer's key in
+gasless simulation, then it prints the exact transaction (decoded arguments and
+raw calldata) and stops. Add `--send` to broadcast, with the deployer's key in
 the `B20_DEPLOYER_KEY` environment variable. The key is read only for `--send`,
 only from that variable, and the tool refuses to send if the key doesn't match
 the deployer. Deploys the ASSET variant; nothing here touches STABLECOIN setup.
