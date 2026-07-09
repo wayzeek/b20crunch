@@ -7,7 +7,11 @@ use anyhow::anyhow;
 use opencl3::command_queue::CommandQueue;
 use opencl3::context::Context;
 use opencl3::device::{get_all_devices, Device, CL_DEVICE_TYPE_GPU};
+use opencl3::kernel::{ExecuteKernel, Kernel};
+use opencl3::memory::{Buffer, CL_MEM_COPY_HOST_PTR, CL_MEM_READ_ONLY, CL_MEM_WRITE_ONLY};
 use opencl3::program::Program;
+use opencl3::types::{cl_ulong, CL_BLOCKING};
+use std::ffi::c_void;
 use std::sync::Arc;
 
 const KERNEL_SRC: &str = include_str!("gpu/kernel.cl");
@@ -29,6 +33,8 @@ pub struct GpuMiner {
     context: Context,
     queue: CommandQueue,
     program: Program,
+    dump_kernel: Kernel,
+    tmpl_buf: Buffer<cl_ulong>,
     max_wg: usize,
     max_alloc: u64,
     batch: u64,
@@ -87,6 +93,21 @@ impl GpuMiner {
             .map_err(|e| anyhow!("queue creation failed: {e}"))?;
         let program = Program::create_and_build_from_source(&context, KERNEL_SRC, "")
             .map_err(|e| anyhow!("OpenCL kernel build failed on {name}; driver build log:\n{e}"))?;
+        let dump_kernel = Kernel::create(&program, "window_dump")
+            .map_err(|e| anyhow!("kernel handle failed: {e}"))?;
+        let tmpl_host: Vec<cl_ulong> = crate::kernel::TailKernel::new(&deployer)
+            .template()
+            .to_vec();
+        // SAFETY: COPY_HOST_PTR reads tmpl_host during creation only
+        let tmpl_buf = unsafe {
+            Buffer::<cl_ulong>::create(
+                &context,
+                CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                25,
+                tmpl_host.as_ptr() as *mut c_void,
+            )
+        }
+        .map_err(|e| anyhow!("template buffer failed: {e}"))?;
         let max_wg = device
             .max_work_group_size()
             .map_err(|e| anyhow!("device query failed: {e}"))?;
@@ -128,6 +149,8 @@ impl GpuMiner {
             context,
             queue,
             program,
+            dump_kernel,
+            tmpl_buf,
             max_wg,
             max_alloc,
             batch,
@@ -135,6 +158,47 @@ impl GpuMiner {
             deployer,
             matcher,
         })
+    }
+
+    /// Hash `batch_len` salts from `start + batch_base` and return each
+    /// window; test plumbing for diffing the ported permutation against
+    /// the tiny-keccak reference.
+    pub fn dump_windows(
+        &mut self,
+        start: u128,
+        batch_base: u64,
+        batch_len: u64,
+    ) -> anyhow::Result<Vec<u128>> {
+        let n = batch_len as usize;
+        let mut out = vec![0 as cl_ulong; 2 * n];
+        // SAFETY: buffer sizes match the slice lengths used below; the
+        // blocking read fences the in-order queue.
+        unsafe {
+            let out_buf = Buffer::<cl_ulong>::create(
+                &self.context,
+                CL_MEM_WRITE_ONLY,
+                2 * n,
+                std::ptr::null_mut(),
+            )
+            .map_err(|e| anyhow!("window buffer failed: {e}"))?;
+            ExecuteKernel::new(&self.dump_kernel)
+                .set_arg(&self.tmpl_buf)
+                .set_arg(&((start >> 64) as cl_ulong))
+                .set_arg(&(start as cl_ulong))
+                .set_arg(&batch_base)
+                .set_arg(&batch_len)
+                .set_arg(&out_buf)
+                .set_global_work_size(n)
+                .enqueue_nd_range(&self.queue)
+                .map_err(|e| anyhow!("window_dump launch failed: {e}"))?;
+            self.queue
+                .enqueue_read_buffer(&out_buf, CL_BLOCKING, 0, &mut out, &[])
+                .map_err(|e| anyhow!("window readback failed: {e}"))?;
+        }
+        Ok(out
+            .chunks_exact(2)
+            .map(|c| ((c[0] as u128) << 64) | c[1] as u128)
+            .collect())
     }
 }
 
@@ -155,6 +219,30 @@ mod tests {
         let miner = test_miner(&GpuConfig::default()).unwrap();
         assert!(miner.max_wg >= 1);
         assert_eq!(miner.capacity, 1 << 16);
+    }
+
+    #[test]
+    fn gpu_windows_match_the_cpu_kernel() {
+        let deployer = b20::parse_address("0x1111111111111111111111111111111111111111").unwrap();
+        let cpu = crate::kernel::TailKernel::new(&deployer);
+        let mut miner = test_miner(&GpuConfig::default()).unwrap();
+        // boundary salts from the spec: u64 carry, u64::MAX + 1, the end of
+        // the u128 space, plus a mid-range value and a nonzero batch_base
+        for &(start, base, len) in &[
+            (0u128, 0u64, 256u64),
+            ((u64::MAX as u128) - 128, 0, 256), // crosses the u64 carry
+            ((u64::MAX as u128) + 1, 0, 64),
+            (u128::MAX - 63, 0, 64), // last salt is exactly u128::MAX
+            (0x1234_5678_9abc_def0_1122_3344_5566_7788u128, 0, 128),
+            (42, 1 << 20, 128), // batch_base offsets add before the carry
+        ] {
+            let wins = miner.dump_windows(start, base, len).unwrap();
+            assert_eq!(wins.len(), len as usize);
+            for (i, w) in wins.iter().enumerate() {
+                let salt = start + base as u128 + i as u128;
+                assert_eq!(*w, cpu.window(salt), "salt {salt}");
+            }
+        }
     }
 
     #[test]
