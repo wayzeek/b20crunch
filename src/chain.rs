@@ -59,14 +59,22 @@ pub async fn verify(
         .getB20Address(0, d, s)
         .call()
         .await
-        .context("getB20Address(ASSET)")?;
+        .with_context(|| format!("getB20Address(ASSET) via {rpc}"))?;
     let stable = f
         .getB20Address(1, d, s)
         .call()
         .await
-        .context("getB20Address(STABLECOIN)")?;
-    let asset_taken = f.isB20Initialized(asset).call().await?;
-    let stable_taken = f.isB20Initialized(stable).call().await?;
+        .with_context(|| format!("getB20Address(STABLECOIN) via {rpc}"))?;
+    let asset_taken = f
+        .isB20Initialized(asset)
+        .call()
+        .await
+        .with_context(|| format!("isB20Initialized(ASSET) via {rpc}"))?;
+    let stable_taken = f
+        .isB20Initialized(stable)
+        .call()
+        .await
+        .with_context(|| format!("isB20Initialized(STABLECOIN) via {rpc}"))?;
 
     println!("deployer:   {}", b20::eip55(&deployer));
     println!("salt:       {} (0x{})", salt, {
@@ -120,9 +128,22 @@ pub async fn verify_hits(
     let mut mismatches = 0usize;
     for h in hits {
         let salt: u128 = h.salt.parse()?;
-        let asset = f.getB20Address(0, d, salt32(salt)).call().await?;
-        let stable = f.getB20Address(1, d, salt32(salt)).call().await?;
-        let taken = f.isB20Initialized(asset).call().await?;
+        let s = salt32(salt);
+        let asset = f
+            .getB20Address(0, d, s)
+            .call()
+            .await
+            .with_context(|| format!("getB20Address(ASSET) via {rpc}"))?;
+        let stable = f
+            .getB20Address(1, d, s)
+            .call()
+            .await
+            .with_context(|| format!("getB20Address(STABLECOIN) via {rpc}"))?;
+        let taken = f
+            .isB20Initialized(asset)
+            .call()
+            .await
+            .with_context(|| format!("isB20Initialized(ASSET) via {rpc}"))?;
         let ok = asset.to_string().eq_ignore_ascii_case(&h.asset_address)
             && stable
                 .to_string()
