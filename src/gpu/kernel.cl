@@ -94,3 +94,33 @@ __kernel void window_dump(
     out[2 * gid] = hi;
     out[2 * gid + 1] = lo;
 }
+
+// entries: 5 u64s per row (mask_hi, mask_lo, value_hi, value_lo,
+// word_index << 32 | pos), position-major (prefix, suffix, inner) and
+// longest-word-first within each class, so first match = the CPU winner.
+// hits: 3 uints per record (salt offset in batch, word index, pos).
+__kernel void mine(
+    __global const u64 *tmpl,
+    u64 start_hi, u64 start_lo, u64 batch_base, u64 batch_len,
+    __global const u64 *entries, uint n_entries,
+    __global uint *hits, volatile __global uint *counter, uint capacity)
+{
+    u64 gid = get_global_id(0);
+    if (gid >= batch_len)
+        return;
+    u64 win_hi, win_lo;
+    window_of(tmpl, start_hi, start_lo, batch_base + gid, &win_hi, &win_lo);
+    for (uint e = 0; e < n_entries; e++) {
+        __global const u64 *en = entries + 5 * (u64)e;
+        if ((win_hi & en[0]) == en[2] && (win_lo & en[1]) == en[3]) {
+            uint idx = atomic_inc(counter);
+            // the counter may run past capacity; never write past the buffer
+            if (idx < capacity) {
+                hits[3 * idx] = (uint)gid;
+                hits[3 * idx + 1] = (uint)(en[4] >> 32);
+                hits[3 * idx + 2] = (uint)en[4];
+            }
+            return;
+        }
+    }
+}

@@ -141,6 +141,68 @@ impl Matcher {
     }
 }
 
+/// One row of the GPU match table: a (mask, value) placement pre-split into
+/// 64-bit halves for the kernel, tagged with its word and position class.
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuEntry {
+    pub mask_hi: u64,
+    pub mask_lo: u64,
+    pub value_hi: u64,
+    pub value_lo: u64,
+    pub word: u32,
+    pub pos: u32,
+}
+
+#[cfg(feature = "gpu")]
+impl Pos {
+    /// Stable wire code for the GPU table: 0 prefix, 1 suffix, 2 inner.
+    pub fn code(self) -> u32 {
+        match self {
+            Pos::Prefix => 0,
+            Pos::Suffix => 1,
+            Pos::Inner => 2,
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl Matcher {
+    /// Flat match table for the GPU kernel, position-major (all prefix
+    /// entries, then suffix, then inner) and longest-word-first within each
+    /// class: exactly find()'s precedence, so a first-match scan in table
+    /// order reproduces the CPU's winner on overlapping matches.
+    pub fn gpu_entries(&self) -> Vec<GpuEntry> {
+        let split = |m: u128, v: u128, word: usize, pos: u32| GpuEntry {
+            mask_hi: (m >> 64) as u64,
+            mask_lo: m as u64,
+            value_hi: (v >> 64) as u64,
+            value_lo: v as u64,
+            word: word as u32,
+            pos,
+        };
+        let mut t = Vec::new();
+        for (groups, pos) in [(&self.prefix, 0u32), (&self.suffix, 1)] {
+            for g in groups {
+                for &(v, idx) in &g.entries {
+                    t.push(split(g.mask, v, idx, pos));
+                }
+            }
+        }
+        for iw in &self.inner {
+            for &(m, v) in &iw.positions {
+                t.push(split(m, v, iw.idx, 2));
+            }
+        }
+        t
+    }
+
+    /// The word behind a GpuEntry::word index; None flags a corrupt record.
+    pub fn word(&self, idx: usize) -> Option<&str> {
+        self.words.get(idx).map(|s| s.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +349,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_table_is_position_major_longest_first() {
+        let words = crate::words::parse_words("ab,c").unwrap(); // ["ab", "c"]
+        let m = Matcher::new(&words, Positions::Any, 1);
+        let t = m.gpu_entries();
+        // prefix ab, prefix c, suffix ab, suffix c, inner ab (17 placements),
+        // inner c (18 placements)
+        assert_eq!(t.len(), 2 + 2 + 17 + 18);
+        let pos_seq: Vec<u32> = t.iter().map(|e| e.pos).collect();
+        assert_eq!(&pos_seq[..4], &[0, 0, 1, 1]);
+        assert!(pos_seq[4..].iter().all(|&p| p == 2));
+        // longest word first within each class
+        assert_eq!((t[0].word, t[1].word), (0, 1));
+        assert_eq!((t[2].word, t[3].word), (0, 1));
+        assert_eq!(t[4].word, 0);
+        assert_eq!(t[4 + 17].word, 1);
+        // "ab" as prefix masks the top byte of the window
+        assert_eq!(t[0].mask_hi, 0xFF00_0000_0000_0000);
+        assert_eq!(t[0].mask_lo, 0);
+        assert_eq!(t[0].value_hi, 0xab00_0000_0000_0000);
     }
 }
 
