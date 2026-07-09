@@ -220,7 +220,9 @@ impl GpuMiner {
 
     /// Hash and match `batch_len` salts from `start + batch_base`. Never
     /// emits a partial batch: capacity overruns discard the whole batch.
-    pub fn run_batch(
+    /// Crate-private: callers must uphold the no-wrap range preconditions
+    /// that mine_loop's clamp arithmetic guarantees.
+    pub(crate) fn run_batch(
         &mut self,
         start: u128,
         batch_base: u64,
@@ -367,8 +369,10 @@ impl GpuMiner {
 
     /// Hash `batch_len` salts from `start + batch_base` and return each
     /// window; test plumbing for diffing the ported permutation against
-    /// the tiny-keccak reference.
-    pub fn dump_windows(
+    /// the tiny-keccak reference (the window_dump kernel entry it drives
+    /// ships unconditionally, so any build can be probed by a test build).
+    #[cfg(test)]
+    pub(crate) fn dump_windows(
         &mut self,
         start: u128,
         batch_base: u64,

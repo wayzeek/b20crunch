@@ -616,10 +616,21 @@ pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
     // phase always sees it already true and hard-exits on the very first
     // press, even when mining itself finished cleanly and never set it.
     stop.store(true, Ordering::Relaxed);
+    // Join every producer BEFORE bailing on any of their errors: the writer
+    // must always be joined so hits already sent are drained and flushed to
+    // the JSONL file even when a producer dies mid-run. The producer error
+    // (the root cause) then takes precedence over any writer error.
+    let mut producer_err = None;
     for h in handles {
-        h.join().expect("producer panicked")?;
+        if let Err(e) = h.join().expect("producer panicked") {
+            producer_err = Some(e);
+        }
     }
-    let records = writer.join().expect("writer panicked")?;
+    let writer_result = writer.join().expect("writer panicked");
+    if let Some(e) = producer_err {
+        return Err(e);
+    }
+    let records = writer_result?;
 
     let n = scanned.load(Ordering::Relaxed);
     let dt = t0.elapsed().as_secs_f64();
