@@ -1,0 +1,105 @@
+# b20crunch
+
+A Rust program for finding salts that spell words in B20 token addresses on Base.
+
+Every B20 token lives at an address shaped like this:
+
+```
+0xB2 000000000000000000 <variant> <eighteen hex characters>
+```
+
+The first part is fixed by the standard. The last 18 characters are derived from
+`keccak256(abi.encode(deployer, salt))` — and you choose the salt. Which means
+those 18 characters can spell something. Your ticker. Your product. `c0ffee`.
+`deadbeef`. Whatever fits in hex.
+
+```
+deployer 0x1111111111111111111111111111111111111111, word c0ffee
+salt:    2000763
+address: 0xB200000000000000000000c0FFeeA7F58D19C4Ef
+```
+
+## How it works
+
+`createB20` derives the token address from the caller and a salt — nothing else.
+That has three pleasant consequences:
+
+- **Salts are deployer-bound.** A salt mined for your account is worthless to
+  anyone else. Share it, post it, tweet it: only your deployer can use it.
+- **No front-running.** Copying your pending transaction from a different sender
+  derives a completely different address.
+- **One salt, everywhere.** The derivation has no chain id and covers both B20
+  variants (ASSET and STABLECOIN), so one salt gives the same address on every
+  network your deployer uses.
+
+One caveat: the *deployer account itself* must call `createB20`. A multisig, a
+proxy, or a deployer contract in between changes the sender and voids the salt —
+mine against whatever account will actually send the transaction.
+
+## Install
+
+```
+git clone https://github.com/wayzeek/b20crunch
+cd b20crunch && cargo build --release
+```
+
+or `cargo install --git https://github.com/wayzeek/b20crunch`. Source is the only
+distribution; there is nothing to trust but the code in front of you.
+
+## Mine
+
+```
+b20crunch mine --deployer 0xYourDeployer --words c0ffee,deadbeef
+```
+
+Words must be hex-expressible: `0-9 a-f`, with the time-honored substitutions
+o=0, l/i=1, s=5, t=7, g=6, z=2. Placement defaults to either end of the window
+(`--positions prefix|suffix|ends|any`). Hits stream to `hits.jsonl` and to your
+terminal. Run bounded with `--count`, resume with `--start`, cross-check the
+results against the live factory with `--verify`.
+
+Expected time to a hit at 35.5 MH/s (both-ends placement, averages — the
+search is memoryless, so your run may be lucky or unlucky):
+
+| word length | expected salts | expected time |
+|---|---|---|
+| 6 | 8.4M | under a second |
+| 7 | 134M | ~4 s |
+| 8 | 2.1B | ~1 min |
+| 9 | 34B | ~16 min |
+| 10 | 550B | ~4 h |
+| 11 | 8.8T | ~3 days |
+
+Letter casing is not choosable: EIP-55 checksum casing falls out of the address
+itself, so `deadbeef` may render as `dEAdbEef`. Look at the exact rendering
+before you fall in love.
+
+## Verify
+
+```
+b20crunch verify --deployer 0xYourDeployer --salt 123456 --expect 0xB2...
+```
+
+Read-only. Derives locally, cross-checks both variant addresses against the live
+factory, and reports whether they are still unclaimed. Always verify before you
+deploy; a (deployer, salt) pair can only be consumed once per network.
+
+## Deploy
+
+```
+b20crunch deploy --deployer 0xYourDeployer --salt 123456 --expect 0xB2... \
+                 --name "My Token" --symbol MTK
+```
+
+Dry-run by default: local derivation, factory derivation, availability, and a
+gasless simulation, then it prints the exact transaction — decoded arguments and
+raw calldata — and stops. Add `--send` to broadcast, with the deployer's key in
+the `B20_DEPLOYER_KEY` environment variable. The key is read only for `--send`,
+only from that variable, and the tool refuses to send if the key doesn't match
+the deployer. Deploys the ASSET variant; nothing here touches STABLECOIN setup.
+
+## A note on taste
+
+Don't mine impersonation or trademark-lookalike addresses. Explorers flag them,
+communities notice, and an address that spells someone else's name is worth less
+than the electricity it took to find. Spell your own thing.
