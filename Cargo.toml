@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Finds salts that spell words in B20 token addresses on Base"
+repository = "https://github.com/wayzeek/b20crunch"
+readme = "README.md"
 
 [dependencies]
 tiny-keccak = { version = "2", features = ["keccak"] }
