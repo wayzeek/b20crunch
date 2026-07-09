@@ -305,8 +305,34 @@ pub struct MineOpts {
     pub inner_min: usize,
     pub start: u128,
     pub count: Option<u64>,
-    pub workers: usize,
+    pub backend: Backend,
     pub out: PathBuf,
+}
+
+/// Which producer fills the hit channel; everything downstream (writer,
+/// progress, Ctrl-C, summary) is backend-agnostic.
+pub enum Backend {
+    Cpu { workers: usize },
+    Gpu(GpuConfig),
+}
+
+/// GPU knobs. `device`/`batch` come from the CLI; `capacity` (hit records
+/// per batch) is internal, overridden by tests to force the overflow path.
+#[derive(Clone, Debug)]
+pub struct GpuConfig {
+    pub device: Option<usize>,
+    pub batch: Option<u64>,
+    pub capacity: usize,
+}
+
+impl Default for GpuConfig {
+    fn default() -> Self {
+        GpuConfig {
+            device: None,
+            batch: None,
+            capacity: 1 << 16,
+        }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
@@ -328,7 +354,16 @@ struct RawHit {
 }
 
 pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
-    anyhow::ensure!(opts.workers >= 1, "--workers must be at least 1");
+    match &opts.backend {
+        Backend::Cpu { workers } => {
+            anyhow::ensure!(*workers >= 1, "--workers must be at least 1")
+        }
+        // GPU support lands behind the `gpu` Cargo feature in a later change;
+        // fail before any file or thread work when it is requested here.
+        Backend::Gpu(_) => {
+            anyhow::bail!("this binary was built without GPU support; rebuild with --features gpu")
+        }
+    }
     let matcher = Arc::new(Matcher::new(&opts.words, opts.positions, opts.inner_min));
     let stop = Arc::new(AtomicBool::new(false));
     let scanned = Arc::new(AtomicU64::new(0));
@@ -416,20 +451,25 @@ pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
     });
 
     let t0 = Instant::now();
-    let mut handles = Vec::new();
-    for _ in 0..opts.workers {
-        let matcher = matcher.clone();
-        let stop = stop.clone();
-        let scanned = scanned.clone();
-        let next = next.clone();
-        let tx = tx.clone();
-        let deployer = opts.deployer;
-        let start = opts.start;
-        let count = opts.count;
-        handles.push(std::thread::spawn(move || {
-            worker(deployer, start, count, &next, &matcher, tx, &scanned, &stop)
-        }));
-    }
+    let handles: Vec<std::thread::JoinHandle<anyhow::Result<()>>> = match &opts.backend {
+        Backend::Cpu { workers } => (0..*workers)
+            .map(|_| {
+                let matcher = matcher.clone();
+                let stop = stop.clone();
+                let scanned = scanned.clone();
+                let next = next.clone();
+                let tx = tx.clone();
+                let deployer = opts.deployer;
+                let start = opts.start;
+                let count = opts.count;
+                std::thread::spawn(move || {
+                    worker(deployer, start, count, &next, &matcher, tx, &scanned, &stop);
+                    Ok(())
+                })
+            })
+            .collect(),
+        Backend::Gpu(_) => unreachable!("rejected at the top of run() until the gpu feature lands"),
+    };
     drop(tx);
 
     // progress loop on the main thread: poll often so run end is noticed
@@ -467,7 +507,7 @@ pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
     // press, even when mining itself finished cleanly and never set it.
     stop.store(true, Ordering::Relaxed);
     for h in handles {
-        h.join().expect("worker panicked");
+        h.join().expect("producer panicked")?;
     }
     let records = writer.join().expect("writer panicked")?;
 
