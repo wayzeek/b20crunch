@@ -39,6 +39,9 @@ One caveat: the *deployer account itself* must call `createB20`. A multisig, a
 proxy, or a deployer contract in between changes the sender and voids the salt.
 Mine against whatever account will actually send the transaction.
 
+The full derivation and the grinding math live in
+[docs/how-it-works.md](docs/how-it-works.md).
+
 ## Install
 
 ```
