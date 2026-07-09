@@ -2,7 +2,7 @@
 //! management, and the batched launch loop. Feature-gated behind `gpu`;
 //! the default build never touches this module.
 
-use crate::mine::{GpuConfig, Matcher};
+use crate::mine::{GpuConfig, Matcher, RawHit};
 use anyhow::anyhow;
 use opencl3::command_queue::CommandQueue;
 use opencl3::context::Context;
@@ -14,7 +14,8 @@ use opencl3::memory::{
 use opencl3::program::Program;
 use opencl3::types::{cl_uint, cl_ulong, CL_BLOCKING};
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 
 const KERNEL_SRC: &str = include_str!("gpu/kernel.cl");
 
@@ -266,6 +267,104 @@ impl GpuMiner {
         }
     }
 
+    /// Re-derive a GPU hit on the CPU and require agreement; the writer only
+    /// ever sees CPU-derived values, so a kernel bug can produce a loud error
+    /// but never a wrong JSONL line.
+    fn check_hit(
+        &self,
+        salt: u128,
+        window: u128,
+        word_idx: u32,
+        pos_code: u32,
+    ) -> anyhow::Result<RawHit> {
+        let Some((pos, word)) = self.matcher.find(window) else {
+            anyhow::bail!("GPU hit at salt {salt} rejected by the CPU matcher: kernel bug");
+        };
+        let gpu_word = self.matcher.word(word_idx as usize).ok_or_else(|| {
+            anyhow!("GPU hit at salt {salt} has out-of-range word index {word_idx}: kernel bug")
+        })?;
+        anyhow::ensure!(
+            word == gpu_word && pos.code() == pos_code,
+            "GPU hit disagrees with CPU at salt {salt}: gpu ({gpu_word}, {pos_code}) vs cpu ({word}, {})",
+            pos.code(),
+        );
+        let mut tail = [0u8; 9];
+        tail.copy_from_slice(&window.to_be_bytes()[..9]);
+        Ok(RawHit {
+            word: word.to_string(),
+            pos,
+            salt,
+            tail,
+        })
+    }
+
+    /// Batched launch loop: the GPU producer feeding the shared hit channel.
+    /// Runs until the count, the u64 offset horizon (matching the CPU
+    /// dispatch counter), the end of the u128 salt space, or Ctrl-C.
+    /// Crate-private because it traffics in RawHit, which never leaves the
+    /// crate (a `pub fn` here would trip the private_interfaces lint).
+    pub(crate) fn mine_loop(
+        mut self,
+        start: u128,
+        count: Option<u64>,
+        tx: mpsc::Sender<RawHit>,
+        scanned: Arc<AtomicU64>,
+        stop: Arc<AtomicBool>,
+    ) -> anyhow::Result<()> {
+        let cpu = crate::kernel::TailKernel::new(&self.deployer);
+        // adaptive batch: halve on overflow, creep back up on clean batches,
+        // so a hit-dense word list settles near its sustainable batch size
+        // instead of re-overflowing every round
+        let mut cur = self.batch;
+        let mut base: u64 = 0;
+        while !stop.load(Ordering::Relaxed) {
+            let remaining = match count {
+                Some(c) if base >= c => break,
+                Some(c) => c - base,
+                None if base == u64::MAX => break,
+                None => u64::MAX - base,
+            };
+            let Some(first) = start.checked_add(base as u128) else {
+                break;
+            };
+            let requested = cur.min(remaining);
+            // clamp so no salt in the batch wraps past u128::MAX (the CPU
+            // worker clamps identically)
+            let mut len = ((requested as u128 - 1).min(u128::MAX - first) + 1) as u64;
+            // shrink-and-rerun: an overflowed batch is discarded whole and
+            // retried smaller; capacity >= 1 makes a size-1 batch always clean
+            let accepted = loop {
+                match self.run_batch(start, base, len)? {
+                    BatchOutcome::Overflow => len = (len / 2).max(1),
+                    BatchOutcome::Hits(hits) => {
+                        for (off, word_idx, pos_code) in hits {
+                            let salt = first + off as u128;
+                            let window = cpu.window(salt);
+                            let hit = self.check_hit(salt, window, word_idx, pos_code)?;
+                            if tx.send(hit).is_err() {
+                                return Ok(()); // writer gone: shutting down
+                            }
+                        }
+                        break len;
+                    }
+                }
+            };
+            // only an accepted batch advances progress: an overflowed run
+            // contributes nothing to the scanned count or resume arithmetic
+            scanned.fetch_add(accepted, Ordering::Relaxed);
+            cur = if accepted < requested {
+                accepted
+            } else {
+                cur.saturating_mul(2).min(self.batch)
+            };
+            if first + (accepted - 1) as u128 == u128::MAX {
+                break; // the u128 salt space itself is exhausted
+            }
+            base += accepted;
+        }
+        Ok(())
+    }
+
     /// Hash `batch_len` salts from `start + batch_base` and return each
     /// window; test plumbing for diffing the ported permutation against
     /// the tiny-keccak reference.
@@ -433,6 +532,27 @@ mod tests {
                 BatchOutcome::Hits(h) => assert!(h.len() <= 1),
                 BatchOutcome::Overflow => panic!("size-1 batch cannot overflow capacity 1"),
             }
+        }
+    }
+
+    #[test]
+    fn mine_loop_reports_hits_through_the_channel() {
+        let deployer = b20::parse_address("0x1111111111111111111111111111111111111111").unwrap();
+        let w = words::parse_words("dead").unwrap();
+        let matcher = Arc::new(Matcher::new(&w, words::Positions::Ends, 6));
+        let miner = GpuMiner::new(&GpuConfig::default(), deployer, matcher).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let scanned = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        miner
+            .mine_loop(0, Some(2_000_000), tx, scanned.clone(), stop)
+            .unwrap();
+        let hits: Vec<RawHit> = rx.try_iter().collect();
+        assert!(hits.len() > 20, "suspiciously few hits: {}", hits.len());
+        assert_eq!(scanned.load(Ordering::Relaxed), 2_000_000);
+        for h in &hits {
+            let tail = b20::tail(&deployer, h.salt);
+            assert_eq!(h.tail, tail, "salt {}", h.salt);
         }
     }
 

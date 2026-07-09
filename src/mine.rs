@@ -431,11 +431,11 @@ pub struct HitRecord {
     pub stablecoin_address: String,
 }
 
-struct RawHit {
-    word: String,
-    pos: Pos,
-    salt: u128,
-    tail: [u8; 9],
+pub(crate) struct RawHit {
+    pub(crate) word: String,
+    pub(crate) pos: Pos,
+    pub(crate) salt: u128,
+    pub(crate) tail: [u8; 9],
 }
 
 pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
@@ -443,13 +443,24 @@ pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
         Backend::Cpu { workers } => {
             anyhow::ensure!(*workers >= 1, "--workers must be at least 1")
         }
-        // GPU support lands behind the `gpu` Cargo feature in a later change;
-        // fail before any file or thread work when it is requested here.
         Backend::Gpu(_) => {
-            anyhow::bail!("this binary was built without GPU support; rebuild with --features gpu")
+            #[cfg(not(feature = "gpu"))]
+            anyhow::bail!("this binary was built without GPU support; rebuild with --features gpu");
         }
     }
     let matcher = Arc::new(Matcher::new(&opts.words, opts.positions, opts.inner_min));
+    // GPU init is synchronous and up front: a missing runtime, an ambiguous
+    // device pick, or an unbuildable kernel fails loudly here, before the
+    // output file opens or any thread spawns.
+    #[cfg(feature = "gpu")]
+    let gpu_miner = match &opts.backend {
+        Backend::Gpu(cfg) => Some(crate::gpu::GpuMiner::new(
+            cfg,
+            opts.deployer,
+            matcher.clone(),
+        )?),
+        Backend::Cpu { .. } => None,
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let scanned = Arc::new(AtomicU64::new(0));
     // ctrlc handler may already be installed when run() is called twice in one
@@ -553,7 +564,21 @@ pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
                 })
             })
             .collect(),
-        Backend::Gpu(_) => unreachable!("rejected at the top of run() until the gpu feature lands"),
+        Backend::Gpu(_) => {
+            #[cfg(not(feature = "gpu"))]
+            unreachable!("rejected at the top of run()");
+            #[cfg(feature = "gpu")]
+            {
+                let miner = gpu_miner.expect("initialized above for the Gpu backend");
+                let tx = tx.clone();
+                let scanned = scanned.clone();
+                let stop = stop.clone();
+                let (start, count) = (opts.start, opts.count);
+                vec![std::thread::spawn(move || {
+                    miner.mine_loop(start, count, tx, scanned, stop)
+                })]
+            }
+        }
     };
     drop(tx);
 
