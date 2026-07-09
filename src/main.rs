@@ -19,6 +19,8 @@ enum Cmd {
     Mine(MineArgs),
     /// Check a salt against the live factory (read-only)
     Verify(VerifyArgs),
+    /// Pre-flight (default) or broadcast a B20 ASSET deployment
+    Deploy(DeployArgs),
 }
 
 #[derive(Args)]
@@ -34,6 +36,32 @@ struct VerifyArgs {
     expect: Option<String>,
     #[arg(long, default_value = b20crunch::chain::DEFAULT_RPC)]
     rpc: String,
+}
+
+#[derive(Args)]
+struct DeployArgs {
+    /// EOA that will call createB20 directly
+    #[arg(long)]
+    deployer: String,
+    /// Salt as a decimal integer
+    #[arg(long)]
+    salt: u128,
+    /// Expected ASSET address; every pre-flight step must agree
+    #[arg(long)]
+    expect: String,
+    /// Token name
+    #[arg(long)]
+    name: String,
+    /// Token symbol
+    #[arg(long)]
+    symbol: String,
+    #[arg(long, default_value_t = 18)]
+    decimals: u8,
+    #[arg(long, default_value = b20crunch::chain::DEFAULT_RPC)]
+    rpc: String,
+    /// Actually broadcast (needs B20_DEPLOYER_KEY); without it, dry-run only
+    #[arg(long)]
+    send: bool,
 }
 
 #[derive(Args)]
@@ -103,6 +131,19 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             Ok(())
+        }
+        Cmd::Deploy(a) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(chain::deploy(chain::DeployOpts {
+                rpc: a.rpc,
+                deployer: b20::parse_address(&a.deployer).map_err(anyhow::Error::msg)?,
+                salt: a.salt,
+                expect: b20::parse_address(&a.expect).map_err(anyhow::Error::msg)?,
+                name: a.name,
+                symbol: a.symbol,
+                decimals: a.decimals,
+                send: a.send,
+            }))
         }
     }
 }
