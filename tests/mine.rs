@@ -79,6 +79,7 @@ fn unopenable_output_path_fails_before_mining() {
     );
 }
 
+#[cfg(not(feature = "gpu"))]
 #[test]
 fn gpu_backend_requires_feature() {
     let dir = tempfile::tempdir().unwrap();
