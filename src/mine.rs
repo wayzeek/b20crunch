@@ -227,9 +227,19 @@ pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
     let scanned = Arc::new(AtomicU64::new(0));
     // ctrlc handler may already be installed when run() is called twice in one
     // process (tests); ignore the AlreadyInstalled error.
+    // Contract: first Ctrl-C requests a graceful stop of mining; a second
+    // Ctrl-C exits immediately with 130, the conventional SIGINT code. Once
+    // mining itself has concluded (below, whether by finishing cleanly or by
+    // Ctrl-C), `stop` is forced true, so a Ctrl-C during the subsequent
+    // `--verify` network phase always hard-exits on its first press instead
+    // of requiring a second one -- the escape hatch for a hung RPC call.
     {
         let stop = stop.clone();
-        let _ = ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed));
+        let _ = ctrlc::set_handler(move || {
+            if stop.swap(true, Ordering::Relaxed) {
+                std::process::exit(130);
+            }
+        });
     }
 
     // combined expected work across words (approximate union = sum)
@@ -261,9 +271,14 @@ pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
     let (tx, rx) = mpsc::channel::<RawHit>();
 
     // writer thread: JSONL file + console line per hit
+    // opened append-only so a resumed run (`--start`) accumulates hits on top
+    // of a prior run's file instead of truncating it
     let out_path = opts.out.clone();
     let writer = std::thread::spawn(move || -> anyhow::Result<Vec<HitRecord>> {
-        let file = std::fs::File::create(&out_path)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&out_path)?;
         let mut buf = std::io::BufWriter::new(file);
         let mut records = Vec::new();
         for hit in rx {
@@ -342,6 +357,11 @@ pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
         );
     }
     eprintln!();
+    // Mining is over here, whether it ran to completion or was Ctrl-C'd.
+    // Force `stop` true so a Ctrl-C during the subsequent `--verify` network
+    // phase always sees it already true and hard-exits on the very first
+    // press, even when mining itself finished cleanly and never set it.
+    stop.store(true, Ordering::Relaxed);
     for h in handles {
         h.join().expect("worker panicked");
     }

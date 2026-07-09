@@ -55,8 +55,10 @@ b20crunch mine --deployer 0xYourDeployer --words c0ffee,deadbeef
 Words must be hex-expressible: `0-9 a-f`, with the time-honored substitutions
 o=0, l/i=1, s=5, t=7, g=6, z=2. Placement defaults to either end of the window
 (`--positions prefix|suffix|ends|any`). Hits stream to `hits.jsonl` and to your
-terminal. Run bounded with `--count`, resume with `--start`, cross-check the
-results against the live factory with `--verify`.
+terminal. The file is append only, so resuming a run with `--start` never
+clobbers hits an earlier run already wrote. Run bounded with `--count`, resume
+with `--start`, cross-check the results against the live factory with
+`--verify`.
 
 Expected time to a hit at 35.5 MH/s, both-ends placement. These are averages;
 the search is memoryless, so your run may be lucky or unlucky:

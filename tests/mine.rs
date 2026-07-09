@@ -36,6 +36,24 @@ fn mined_hits_rederive_and_match_placement() {
     }
     let file_lines = std::fs::read_to_string(&out).unwrap().lines().count();
     assert_eq!(file_lines, hits.len());
+
+    // resuming with the same --out must append, not truncate: a second run
+    // picking up where the first left off should leave both runs' hits in
+    // the file, proving --start-based resume never clobbers earlier hits.
+    let hits2 = mine::run(mine::MineOpts {
+        deployer,
+        words: words::parse_words("dead").unwrap(),
+        positions: words::Positions::Ends,
+        inner_min: 6,
+        start: 2_000_000,
+        count: Some(2_000_000),
+        workers: 2,
+        out: out.clone(),
+    })
+    .unwrap();
+
+    let file_lines_after = std::fs::read_to_string(&out).unwrap().lines().count();
+    assert_eq!(file_lines_after, hits.len() + hits2.len());
 }
 
 fn hex32(salt: u128) -> String {

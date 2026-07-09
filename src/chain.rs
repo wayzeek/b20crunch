@@ -47,6 +47,10 @@ fn salt32(salt: u128) -> B256 {
 /// (offset-prefixed), byte-identical to the proven production encoding.
 pub fn encode_params(name: &str, symbol: &str, deployer: Address, decimals: u8) -> Vec<u8> {
     let params = AssetParams {
+        // Not the ASSET/STABLECOIN selector: this is the params-tuple's own
+        // leading byte, part of the production-proven params encoding, and
+        // is unrelated to the `createB20(variant, ...)` top-level factory
+        // variant argument passed alongside it (always 0 for ASSET below).
         variant: 1,
         name: name.to_string(),
         symbol: symbol.to_string(),
