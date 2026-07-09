@@ -1,0 +1,24 @@
+[package]
+name = "b20crunch"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Finds salts that spell words in B20 token addresses on Base"
+
+[dependencies]
+tiny-keccak = { version = "2", features = ["keccak"] }
+clap = { version = "4", features = ["derive"] }
+num_cpus = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ctrlc = "3"
+anyhow = "1"
+alloy = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
