@@ -1,6 +1,7 @@
 # b20crunch
 
-A Rust program for finding salts that spell words in B20 token addresses on Base.
+A vanity address miner for B20 tokens on Base, written in Rust: finds salts that
+spell words in your token address.
 
 Every B20 token lives at an address shaped like this:
 
