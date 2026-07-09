@@ -3,6 +3,8 @@
 A vanity address miner for B20 tokens on Base, written in Rust: finds salts that
 spell words in your token address.
 
+<img width="1280" height="640" alt="social-card" src="https://github.com/user-attachments/assets/4e4d66b8-7610-4f89-b3e1-ce42edb6914e" />
+
 Every B20 token lives at an address shaped like this:
 
 ```
