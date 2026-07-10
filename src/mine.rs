@@ -182,7 +182,10 @@ impl Matcher {
             pos,
         };
         let mut t = Vec::new();
-        for (groups, pos) in [(&self.prefix, 0u32), (&self.suffix, 1)] {
+        for (groups, pos) in [
+            (&self.prefix, Pos::Prefix.code()),
+            (&self.suffix, Pos::Suffix.code()),
+        ] {
             for g in groups {
                 for &(v, idx) in &g.entries {
                     t.push(split(g.mask, v, idx, pos));
@@ -191,7 +194,7 @@ impl Matcher {
         }
         for iw in &self.inner {
             for &(m, v) in &iw.positions {
-                t.push(split(m, v, iw.idx, 2));
+                t.push(split(m, v, iw.idx, Pos::Inner.code()));
             }
         }
         t
@@ -619,11 +622,21 @@ pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
     // Join every producer BEFORE bailing on any of their errors: the writer
     // must always be joined so hits already sent are drained and flushed to
     // the JSONL file even when a producer dies mid-run. The producer error
-    // (the root cause) then takes precedence over any writer error.
+    // (the root cause) then takes precedence over any writer error. A
+    // producer panic (opencl3's ExecuteKernel helpers panic on driver errors
+    // instead of returning them) folds into the same path for the same
+    // reason: it must not abort the process past the writer join.
     let mut producer_err = None;
     for h in handles {
-        if let Err(e) = h.join().expect("producer panicked") {
-            producer_err = Some(e);
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => producer_err = Some(e),
+            Err(panic) => {
+                producer_err = Some(anyhow::anyhow!(
+                    "producer panicked: {}",
+                    panic_message(&*panic)
+                ))
+            }
         }
     }
     let writer_result = writer.join().expect("writer panicked");
@@ -644,6 +657,18 @@ pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
         opts.out.display()
     );
     Ok(records)
+}
+
+/// The panic payload as text: thread panics carry a &str or String message
+/// in practice; anything else gets a placeholder.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s
+    } else {
+        "non-string panic payload"
+    }
 }
 
 /// Salts per dispatch chunk: big enough that the shared counter is

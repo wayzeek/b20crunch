@@ -37,7 +37,10 @@ pub enum BatchOutcome {
     Overflow,
 }
 
-#[allow(dead_code)] // fields are consumed as the kernel and launch loop land
+// Not every field is read in the release mining path: max_wg/max_alloc are
+// held for the deferred perf-tuning pass, dump_kernel is test plumbing, and
+// device/program document what the queue and kernels were built from.
+#[allow(dead_code)]
 pub struct GpuMiner {
     device: Device,
     context: Context,
@@ -67,6 +70,25 @@ impl GpuMiner {
         deployer: [u8; 20],
         matcher: Arc<Matcher>,
     ) -> anyhow::Result<GpuMiner> {
+        // device-independent config checks first: a bad --gpu-batch must
+        // report as such even on a machine with no OpenCL runtime at all
+        let batch = cfg.batch.unwrap_or(DEFAULT_BATCH);
+        // the hit counter and the record offset field are u32: a batch must
+        // never be able to wrap them
+        anyhow::ensure!(
+            (1..=u32::MAX as u64).contains(&batch),
+            "--gpu-batch must be between 1 and {}",
+            u32::MAX
+        );
+        let capacity =
+            u32::try_from(cfg.capacity).map_err(|_| anyhow!("hit capacity must fit in u32"))?;
+        // records are 3 uints wide and indexed as 3 * idx inside the kernel;
+        // keep that multiply inside u32 range
+        anyhow::ensure!(
+            (1..=u32::MAX / 3).contains(&capacity),
+            "hit capacity must be between 1 and {}",
+            u32::MAX / 3
+        );
         let ids = get_all_devices(CL_DEVICE_TYPE_GPU).map_err(|e| {
             anyhow!("OpenCL enumeration failed (is an OpenCL runtime/ICD installed?): {e}")
         })?;
@@ -129,23 +151,6 @@ impl GpuMiner {
         let max_alloc = device
             .max_mem_alloc_size()
             .map_err(|e| anyhow!("device query failed: {e}"))?;
-        let batch = cfg.batch.unwrap_or(DEFAULT_BATCH);
-        // the hit counter and the record offset field are u32: a batch must
-        // never be able to wrap them
-        anyhow::ensure!(
-            (1..=u32::MAX as u64).contains(&batch),
-            "--gpu-batch must be between 1 and {}",
-            u32::MAX
-        );
-        let capacity =
-            u32::try_from(cfg.capacity).map_err(|_| anyhow!("hit capacity must fit in u32"))?;
-        // records are 3 uints wide and indexed as 3 * idx inside the kernel;
-        // keep that multiply inside u32 range
-        anyhow::ensure!(
-            (1..=u32::MAX / 3).contains(&capacity),
-            "hit capacity must be between 1 and {}",
-            u32::MAX / 3
-        );
         // size-within-device-limits: the hit buffer is the only allocation
         // that scales with config (batch is already capped at the u32
         // counter/offset width, which also bounds the global work size on
@@ -340,6 +345,13 @@ impl GpuMiner {
                     BatchOutcome::Overflow => len = (len / 2).max(1),
                     BatchOutcome::Hits(hits) => {
                         for (off, word_idx, pos_code) in hits {
+                            // the host validates everything the kernel
+                            // reports; an offset outside the batch would
+                            // otherwise re-derive some unrelated salt
+                            anyhow::ensure!(
+                                (off as u64) < len,
+                                "GPU hit offset {off} outside the {len}-salt batch: kernel bug"
+                            );
                             let salt = first + off as u128;
                             let window = cpu.window(salt);
                             let hit = self.check_hit(salt, window, word_idx, pos_code)?;
@@ -416,6 +428,23 @@ mod tests {
     use super::*;
     use crate::{b20, words};
 
+    /// Device index for test runs: hosts with several GPUs set
+    /// B20CRUNCH_TEST_DEVICE; single-GPU hosts leave it unset and exercise
+    /// the auto-selection path.
+    fn test_device() -> Option<usize> {
+        std::env::var("B20CRUNCH_TEST_DEVICE").ok().map(|v| {
+            v.parse()
+                .expect("B20CRUNCH_TEST_DEVICE must be a device index")
+        })
+    }
+
+    pub(super) fn test_cfg() -> GpuConfig {
+        GpuConfig {
+            device: test_device(),
+            ..Default::default()
+        }
+    }
+
     pub(super) fn test_miner(cfg: &GpuConfig) -> anyhow::Result<GpuMiner> {
         let deployer = b20::parse_address("0x1111111111111111111111111111111111111111").unwrap();
         let w = words::parse_words("dead").unwrap();
@@ -425,7 +454,7 @@ mod tests {
 
     #[test]
     fn builds_on_the_local_device() {
-        let miner = test_miner(&GpuConfig::default()).unwrap();
+        let miner = test_miner(&test_cfg()).unwrap();
         assert!(miner.max_wg >= 1);
         assert_eq!(miner.capacity, 1 << 16);
     }
@@ -434,7 +463,7 @@ mod tests {
     fn gpu_windows_match_the_cpu_kernel() {
         let deployer = b20::parse_address("0x1111111111111111111111111111111111111111").unwrap();
         let cpu = crate::kernel::TailKernel::new(&deployer);
-        let mut miner = test_miner(&GpuConfig::default()).unwrap();
+        let mut miner = test_miner(&test_cfg()).unwrap();
         // boundary salts from the spec: u64 carry, u64::MAX + 1, the end of
         // the u128 space, plus a mid-range value and a nonzero batch_base
         for &(start, base, len) in &[
@@ -475,7 +504,7 @@ mod tests {
         let matcher = Arc::new(Matcher::new(&w, words::Positions::Any, 2));
         let cfg = GpuConfig {
             capacity,
-            ..Default::default()
+            ..test_cfg()
         };
         (
             GpuMiner::new(&cfg, deployer, matcher.clone()).unwrap(),
@@ -544,7 +573,7 @@ mod tests {
         let deployer = b20::parse_address("0x1111111111111111111111111111111111111111").unwrap();
         let w = words::parse_words("dead").unwrap();
         let matcher = Arc::new(Matcher::new(&w, words::Positions::Ends, 6));
-        let miner = GpuMiner::new(&GpuConfig::default(), deployer, matcher).unwrap();
+        let miner = GpuMiner::new(&test_cfg(), deployer, matcher).unwrap();
         let (tx, rx) = mpsc::channel();
         let scanned = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));

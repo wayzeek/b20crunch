@@ -40,8 +40,21 @@ fn cpu() -> mine::Backend {
     mine::Backend::Cpu { workers: 2 }
 }
 
+/// Device index for test runs: hosts with several GPUs set
+/// B20CRUNCH_TEST_DEVICE; single-GPU hosts leave it unset and exercise
+/// the auto-selection path.
+fn test_device() -> Option<usize> {
+    std::env::var("B20CRUNCH_TEST_DEVICE").ok().map(|v| {
+        v.parse()
+            .expect("B20CRUNCH_TEST_DEVICE must be a device index")
+    })
+}
+
 fn gpu() -> mine::Backend {
-    mine::Backend::Gpu(mine::GpuConfig::default())
+    mine::Backend::Gpu(mine::GpuConfig {
+        device: test_device(),
+        ..Default::default()
+    })
 }
 
 #[test]
@@ -105,7 +118,7 @@ fn forced_overflow_shrinks_and_loses_nothing() {
     // ~1/16 of salts hit; capacity 8 against 64k batches forces the
     // shrink-and-rerun path over and over
     let over = mine::Backend::Gpu(mine::GpuConfig {
-        device: None,
+        device: test_device(),
         batch: Some(1 << 16),
         capacity: 8,
     });

@@ -14,4 +14,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # compiles and lints the GPU backend and its tests; the OpenCL runtime
+      # loads at run time, so no GPU or driver is needed to build. Running
+      # tests/gpu.rs still requires real hardware and stays a local gate.
+      - run: cargo clippy --all-targets --features gpu -- -D warnings
       - run: cargo test
