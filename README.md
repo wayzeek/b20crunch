@@ -105,7 +105,7 @@ measured on named hardware.
 ## Verify
 
 ```
-b20crunch verify --deployer 0xYourDeployer --salt 123456 --expect 0xB2...
+b20crunch verify --deployer 0xYourDeployer --salt 123456 --expect 0xB20...
 ```
 
 Read-only. Derives locally, cross-checks both variant addresses against the live
@@ -115,7 +115,7 @@ deploy; a (deployer, salt) pair can only be consumed once per network.
 ## Deploy
 
 ```
-b20crunch deploy --deployer 0xYourDeployer --salt 123456 --expect 0xB2... \
+b20crunch deploy --deployer 0xYourDeployer --salt 123456 --expect 0xB20... \
                  --name "My Token" --symbol MTK
 ```
 
