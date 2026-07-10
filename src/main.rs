@@ -85,8 +85,17 @@ struct MineArgs {
     #[arg(long)]
     count: Option<u64>,
     /// Worker threads (default: logical cores)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "gpu")]
     workers: Option<usize>,
+    /// Mine on a GPU via OpenCL instead of CPU threads (build with --features gpu)
+    #[arg(long)]
+    gpu: bool,
+    /// GPU device index when several are present (with --gpu)
+    #[arg(long, requires = "gpu")]
+    device: Option<usize>,
+    /// Salts per GPU dispatch, for tuning (with --gpu)
+    #[arg(long, requires = "gpu")]
+    gpu_batch: Option<u64>,
     /// Output JSONL file
     #[arg(long, default_value = "hits.jsonl")]
     out: PathBuf,
@@ -103,6 +112,17 @@ fn main() -> anyhow::Result<()> {
         Cmd::Mine(a) => {
             let deployer = b20::parse_address(&a.deployer).map_err(anyhow::Error::msg)?;
             let words = words::parse_words(&a.words).map_err(anyhow::Error::msg)?;
+            let backend = if a.gpu {
+                mine::Backend::Gpu(mine::GpuConfig {
+                    device: a.device,
+                    batch: a.gpu_batch,
+                    ..Default::default()
+                })
+            } else {
+                mine::Backend::Cpu {
+                    workers: a.workers.unwrap_or_else(num_cpus::get),
+                }
+            };
             let hits = mine::run(mine::MineOpts {
                 deployer,
                 words,
@@ -110,7 +130,7 @@ fn main() -> anyhow::Result<()> {
                 inner_min: a.inner_min,
                 start: a.start,
                 count: a.count,
-                workers: a.workers.unwrap_or_else(num_cpus::get),
+                backend,
                 out: a.out,
             })?;
             if a.verify {

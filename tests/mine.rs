@@ -12,7 +12,7 @@ fn mined_hits_rederive_and_match_placement() {
         inner_min: 6,
         start: 0,
         count: Some(2_000_000),
-        workers: 2,
+        backend: mine::Backend::Cpu { workers: 2 },
         out: out.clone(),
     })
     .unwrap();
@@ -47,7 +47,7 @@ fn mined_hits_rederive_and_match_placement() {
         inner_min: 6,
         start: 2_000_000,
         count: Some(2_000_000),
-        workers: 2,
+        backend: mine::Backend::Cpu { workers: 2 },
         out: out.clone(),
     })
     .unwrap();
@@ -69,12 +69,34 @@ fn unopenable_output_path_fails_before_mining() {
         inner_min: 6,
         start: 0,
         count: None, // unbounded: only fails fast if the file opens up front
-        workers: 2,
+        backend: mine::Backend::Cpu { workers: 2 },
         out: std::path::PathBuf::from("/no/such/directory/hits.jsonl"),
     })
     .unwrap_err();
     assert!(
         err.to_string().contains("cannot open output file"),
+        "unexpected error: {err}"
+    );
+}
+
+#[cfg(not(feature = "gpu"))]
+#[test]
+fn gpu_backend_requires_feature() {
+    let dir = tempfile::tempdir().unwrap();
+    let deployer = b20::parse_address("0x1111111111111111111111111111111111111111").unwrap();
+    let err = mine::run(mine::MineOpts {
+        deployer,
+        words: words::parse_words("dead").unwrap(),
+        positions: words::Positions::Ends,
+        inner_min: 6,
+        start: 0,
+        count: Some(1),
+        backend: mine::Backend::Gpu(mine::GpuConfig::default()),
+        out: dir.path().join("hits.jsonl"),
+    })
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("--features gpu"),
         "unexpected error: {err}"
     );
 }

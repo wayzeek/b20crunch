@@ -126,6 +126,12 @@ impl TailKernel {
         )
     }
 
+    /// The padded per-deployer state template (salt lanes 6 and 7 zero);
+    /// the GPU backend uploads this exact state.
+    pub fn template(&self) -> &[u64; 25] {
+        &self.template
+    }
+
     /// First 16 digest bytes as a big-endian u128; bits 127..=56 are the
     /// 18-nibble grindable window.
     #[inline]

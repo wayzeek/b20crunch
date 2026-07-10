@@ -82,6 +82,26 @@ Letter casing is not choosable: EIP-55 checksum casing falls out of the address
 itself, so `deadbeef` may render as `dEAdbEef`. Look at the exact rendering
 before you fall in love.
 
+## GPU (OpenCL)
+
+The default build is CPU-only. The GPU backend ships behind a Cargo feature:
+
+```
+cargo build --release --features gpu
+./target/release/b20crunch mine --gpu --deployer 0xYourDeployer --words dead,beef
+```
+
+`--device N` picks a GPU when several are present (the error lists them), and
+`--gpu-batch N` sets salts per dispatch for tuning. Everything else -- words,
+positions, `--start` resume, JSONL output, `--verify` -- behaves exactly as on
+the CPU, and a fixed salt range produces the identical hit set on either
+backend. The kernel ships as OpenCL source inside the binary and is compiled
+by your GPU driver at runtime; there is nothing precompiled to trust.
+
+Requires a working OpenCL runtime: NVIDIA and AMD drivers include one, and
+macOS has one built in. GPU rates will be added to the table above only as
+measured on named hardware.
+
 ## Verify
 
 ```

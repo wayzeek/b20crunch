@@ -141,6 +141,71 @@ impl Matcher {
     }
 }
 
+/// One row of the GPU match table: a (mask, value) placement pre-split into
+/// 64-bit halves for the kernel, tagged with its word and position class.
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuEntry {
+    pub mask_hi: u64,
+    pub mask_lo: u64,
+    pub value_hi: u64,
+    pub value_lo: u64,
+    pub word: u32,
+    pub pos: u32,
+}
+
+#[cfg(feature = "gpu")]
+impl Pos {
+    /// Stable wire code for the GPU table: 0 prefix, 1 suffix, 2 inner.
+    pub fn code(self) -> u32 {
+        match self {
+            Pos::Prefix => 0,
+            Pos::Suffix => 1,
+            Pos::Inner => 2,
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl Matcher {
+    /// Flat match table for the GPU kernel, position-major (all prefix
+    /// entries, then suffix, then inner) and longest-word-first within each
+    /// class: exactly find()'s precedence, so a first-match scan in table
+    /// order reproduces the CPU's winner on overlapping matches.
+    pub fn gpu_entries(&self) -> Vec<GpuEntry> {
+        let split = |m: u128, v: u128, word: usize, pos: u32| GpuEntry {
+            mask_hi: (m >> 64) as u64,
+            mask_lo: m as u64,
+            value_hi: (v >> 64) as u64,
+            value_lo: v as u64,
+            word: word as u32,
+            pos,
+        };
+        let mut t = Vec::new();
+        for (groups, pos) in [
+            (&self.prefix, Pos::Prefix.code()),
+            (&self.suffix, Pos::Suffix.code()),
+        ] {
+            for g in groups {
+                for &(v, idx) in &g.entries {
+                    t.push(split(g.mask, v, idx, pos));
+                }
+            }
+        }
+        for iw in &self.inner {
+            for &(m, v) in &iw.positions {
+                t.push(split(m, v, iw.idx, Pos::Inner.code()));
+            }
+        }
+        t
+    }
+
+    /// The word behind a GpuEntry::word index; None flags a corrupt record.
+    pub fn word(&self, idx: usize) -> Option<&str> {
+        self.words.get(idx).map(|s| s.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +353,29 @@ mod tests {
             }
         }
     }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_table_is_position_major_longest_first() {
+        let words = crate::words::parse_words("ab,c").unwrap(); // ["ab", "c"]
+        let m = Matcher::new(&words, Positions::Any, 1);
+        let t = m.gpu_entries();
+        // prefix ab, prefix c, suffix ab, suffix c, inner ab (17 placements),
+        // inner c (18 placements)
+        assert_eq!(t.len(), 2 + 2 + 17 + 18);
+        let pos_seq: Vec<u32> = t.iter().map(|e| e.pos).collect();
+        assert_eq!(&pos_seq[..4], &[0, 0, 1, 1]);
+        assert!(pos_seq[4..].iter().all(|&p| p == 2));
+        // longest word first within each class
+        assert_eq!((t[0].word, t[1].word), (0, 1));
+        assert_eq!((t[2].word, t[3].word), (0, 1));
+        assert_eq!(t[4].word, 0);
+        assert_eq!(t[4 + 17].word, 1);
+        // "ab" as prefix masks the top byte of the window
+        assert_eq!(t[0].mask_hi, 0xFF00_0000_0000_0000);
+        assert_eq!(t[0].mask_lo, 0);
+        assert_eq!(t[0].value_hi, 0xab00_0000_0000_0000);
+    }
 }
 
 use crate::{b20, kernel, words};
@@ -305,8 +393,34 @@ pub struct MineOpts {
     pub inner_min: usize,
     pub start: u128,
     pub count: Option<u64>,
-    pub workers: usize,
+    pub backend: Backend,
     pub out: PathBuf,
+}
+
+/// Which producer fills the hit channel; everything downstream (writer,
+/// progress, Ctrl-C, summary) is backend-agnostic.
+pub enum Backend {
+    Cpu { workers: usize },
+    Gpu(GpuConfig),
+}
+
+/// GPU knobs. `device`/`batch` come from the CLI; `capacity` (hit records
+/// per batch) is internal, overridden by tests to force the overflow path.
+#[derive(Clone, Debug)]
+pub struct GpuConfig {
+    pub device: Option<usize>,
+    pub batch: Option<u64>,
+    pub capacity: usize,
+}
+
+impl Default for GpuConfig {
+    fn default() -> Self {
+        GpuConfig {
+            device: None,
+            batch: None,
+            capacity: 1 << 16,
+        }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
@@ -320,16 +434,36 @@ pub struct HitRecord {
     pub stablecoin_address: String,
 }
 
-struct RawHit {
-    word: String,
-    pos: Pos,
-    salt: u128,
-    tail: [u8; 9],
+pub(crate) struct RawHit {
+    pub(crate) word: String,
+    pub(crate) pos: Pos,
+    pub(crate) salt: u128,
+    pub(crate) tail: [u8; 9],
 }
 
 pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
-    anyhow::ensure!(opts.workers >= 1, "--workers must be at least 1");
+    match &opts.backend {
+        Backend::Cpu { workers } => {
+            anyhow::ensure!(*workers >= 1, "--workers must be at least 1")
+        }
+        Backend::Gpu(_) => {
+            #[cfg(not(feature = "gpu"))]
+            anyhow::bail!("this binary was built without GPU support; rebuild with --features gpu");
+        }
+    }
     let matcher = Arc::new(Matcher::new(&opts.words, opts.positions, opts.inner_min));
+    // GPU init is synchronous and up front: a missing runtime, an ambiguous
+    // device pick, or an unbuildable kernel fails loudly here, before the
+    // output file opens or any thread spawns.
+    #[cfg(feature = "gpu")]
+    let gpu_miner = match &opts.backend {
+        Backend::Gpu(cfg) => Some(crate::gpu::GpuMiner::new(
+            cfg,
+            opts.deployer,
+            matcher.clone(),
+        )?),
+        Backend::Cpu { .. } => None,
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let scanned = Arc::new(AtomicU64::new(0));
     // ctrlc handler may already be installed when run() is called twice in one
@@ -416,20 +550,39 @@ pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
     });
 
     let t0 = Instant::now();
-    let mut handles = Vec::new();
-    for _ in 0..opts.workers {
-        let matcher = matcher.clone();
-        let stop = stop.clone();
-        let scanned = scanned.clone();
-        let next = next.clone();
-        let tx = tx.clone();
-        let deployer = opts.deployer;
-        let start = opts.start;
-        let count = opts.count;
-        handles.push(std::thread::spawn(move || {
-            worker(deployer, start, count, &next, &matcher, tx, &scanned, &stop)
-        }));
-    }
+    let handles: Vec<std::thread::JoinHandle<anyhow::Result<()>>> = match &opts.backend {
+        Backend::Cpu { workers } => (0..*workers)
+            .map(|_| {
+                let matcher = matcher.clone();
+                let stop = stop.clone();
+                let scanned = scanned.clone();
+                let next = next.clone();
+                let tx = tx.clone();
+                let deployer = opts.deployer;
+                let start = opts.start;
+                let count = opts.count;
+                std::thread::spawn(move || {
+                    worker(deployer, start, count, &next, &matcher, tx, &scanned, &stop);
+                    Ok(())
+                })
+            })
+            .collect(),
+        Backend::Gpu(_) => {
+            #[cfg(not(feature = "gpu"))]
+            unreachable!("rejected at the top of run()");
+            #[cfg(feature = "gpu")]
+            {
+                let miner = gpu_miner.expect("initialized above for the Gpu backend");
+                let tx = tx.clone();
+                let scanned = scanned.clone();
+                let stop = stop.clone();
+                let (start, count) = (opts.start, opts.count);
+                vec![std::thread::spawn(move || {
+                    miner.mine_loop(start, count, tx, scanned, stop)
+                })]
+            }
+        }
+    };
     drop(tx);
 
     // progress loop on the main thread: poll often so run end is noticed
@@ -466,10 +619,31 @@ pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
     // phase always sees it already true and hard-exits on the very first
     // press, even when mining itself finished cleanly and never set it.
     stop.store(true, Ordering::Relaxed);
+    // Join every producer BEFORE bailing on any of their errors: the writer
+    // must always be joined so hits already sent are drained and flushed to
+    // the JSONL file even when a producer dies mid-run. The producer error
+    // (the root cause) then takes precedence over any writer error. A
+    // producer panic (opencl3's ExecuteKernel helpers panic on driver errors
+    // instead of returning them) folds into the same path for the same
+    // reason: it must not abort the process past the writer join.
+    let mut producer_err = None;
     for h in handles {
-        h.join().expect("worker panicked");
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => producer_err = Some(e),
+            Err(panic) => {
+                producer_err = Some(anyhow::anyhow!(
+                    "producer panicked: {}",
+                    panic_message(&*panic)
+                ))
+            }
+        }
     }
-    let records = writer.join().expect("writer panicked")?;
+    let writer_result = writer.join().expect("writer panicked");
+    if let Some(e) = producer_err {
+        return Err(e);
+    }
+    let records = writer_result?;
 
     let n = scanned.load(Ordering::Relaxed);
     let dt = t0.elapsed().as_secs_f64();
@@ -483,6 +657,18 @@ pub fn run(opts: MineOpts) -> anyhow::Result<Vec<HitRecord>> {
         opts.out.display()
     );
     Ok(records)
+}
+
+/// The panic payload as text: thread panics carry a &str or String message
+/// in practice; anything else gets a placeholder.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s
+    } else {
+        "non-string panic payload"
+    }
 }
 
 /// Salts per dispatch chunk: big enough that the shared counter is
